@@ -7,30 +7,25 @@
 //! leaves whose `distance` matches their path from it (so another tree's leaves don't count), and
 //! the vines, cocoa and bee nests touching any of them. No leaves: not a tree.
 //!
-//! `destroy_block` (a player hook: reads only) finds the tree and lets the chopped log break as
+//! `break_block` finds the tree and lets the chopped log break as
 //! vanilla does; the next server tick drops every other block's loot, mined with the held tool,
 //! at the chopped log (`loot spawn ... mine ... mainhand`), clears the blocks (attachments,
 //! leaves, then logs, so nothing pops twice), and wears the axe one point per extra log.
 //!
-//! Sneaking: the host's comes from the client's `movement_input` (same process), a LAN guest's
-//! from `player_toggle_sneak`.
+//! Sneaking is the player's `is_shift_key_down` (the old port tracked it from `movement_input`
+//! and `player_toggle_sneak`); the held axe is the player's main hand.
 //!
 //! Not ported: the falling animation and its sounds, the 4 s before the drops land, slower
 //! mining for bigger trees (no mining-speed hook), extra hunger (no exhaustion command),
 //! Unbreaking on the extra wear, and the cactus, bamboo and chorus "trees" (vanilla already
 //! breaks those upwards). Log and leaf tags are matched by name (no block tag API).
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use horizon_client::mod_api::{
-    DestroyBlockEvent, Flow, Hooks, Host, MovementInputEvent, PlayerToggleSneakEvent,
-    ServerTickEvent, ServerTickPhase,
+use mod_api::{
+    BreakBlockEvent, Flow, GameMode, Hand, Hooks, Host, LevelRef, LivingRef, ServerHost, ServerTickEvent,
+    ServerTickPhase,
 };
-
-pub fn hooks() -> Box<dyn Hooks> {
-    Box::new(Mod::default())
-}
 
 pub const MAX_LOGS: usize = 256;
 pub const MAX_LEAVES_RADIUS: u32 = 10;
@@ -251,64 +246,54 @@ impl Felling {
 #[derive(Default)]
 struct Mod {
     queue: Mutex<Vec<Felling>>,
-    /// The local player's sneak, from the client side of this process.
-    host_sneaking: AtomicBool,
-    /// LAN guests' sneak.
-    guests_sneaking: Mutex<HashMap<u128, bool>>,
 }
 
-fn read_block(host: &dyn Host, pos: [i32; 3]) -> Block {
+fn read_block(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Block {
     Block {
-        name: host.block(pos),
-        distance: host.block_property(pos, "distance").and_then(|d| d.parse().ok()),
-        persistent: host.block_property(pos, "persistent").as_deref() == Some("true"),
+        name: level.block(host, pos).map(|k| k.id(host)).unwrap_or_default(),
+        distance: level.block_property(host, pos, "distance").and_then(|d| d.parse().ok()),
+        persistent: level.block_property(host, pos, "persistent").as_deref() == Some("true"),
     }
 }
 
+#[mod_api::horizon_mod]
 impl Hooks for Mod {
-    fn movement_input(&self, _host: &dyn Host, event: &mut MovementInputEvent) {
-        self.host_sneaking.store(event.sneak, Ordering::Relaxed);
-    }
-
-    fn player_toggle_sneak(&self, _host: &mut dyn Host, event: &mut PlayerToggleSneakEvent<'_>) {
-        let mut guests = self.guests_sneaking.lock().unwrap_or_else(|e| e.into_inner());
-        guests.insert(event.player, event.sneaking);
-    }
-
-    fn destroy_block(&self, host: &mut dyn Host, event: &mut DestroyBlockEvent) -> Flow {
+    fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
         if !host.on("fallingtrees") {
             return Flow::Continue;
         }
-        let Some(player) = host.acting_player() else { return Flow::Continue };
-        if player.game_mode > 1 {
+        let Some(player) = host.players().acting_player() else { return Flow::Continue };
+        let host: &dyn Host = &*host;
+        let mode = player.game_mode(host);
+        if !matches!(mode, Some(GameMode::Survival | GameMode::Creative)) {
             return Flow::Continue;
         }
-        let sneaking = {
-            let guests = self.guests_sneaking.lock().unwrap_or_else(|e| e.into_inner());
-            guests.get(&player.uuid).copied().unwrap_or_else(|| self.host_sneaking.load(Ordering::Relaxed))
-        };
-        if sneaking {
+        if player.entity().is_shift_key_down(host) == Some(true) {
             return Flow::Continue;
         }
-        let Some((item, _, _)) = host.held() else { return Flow::Continue };
+        let Some(held) = LivingRef::new(player.entity()).hand_item(host, Hand::Main) else { return Flow::Continue };
+        let item = held.item().id(host);
         if !is_axe(&item) {
             return Flow::Continue;
         }
-        let read = |p: [i32; 3]| read_block(host, p);
+        let (Some(level), Some(dim), Some(name)) = (player.level(host), player.dimension(host), player.name(host)) else {
+            return Flow::Continue;
+        };
+        let read = |p: [i32; 3]| read_block(host, level, p);
         let Some(tree) = find_tree(event.pos, &read) else { return Flow::Continue };
-        let axe = (player.game_mode == 0).then_some(item);
+        let axe = matches!(mode, Some(GameMode::Survival)).then_some(item);
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.push(Felling { dimension: player.dimension, player: player.name, origin: event.pos, tree, axe });
+        queue.push(Felling { dimension: dim.to_string(), player: name, origin: event.pos, tree, axe });
         Flow::Continue
     }
 
-    fn server_tick(&self, host: &mut dyn Host, event: &mut ServerTickEvent<'_>) {
+    fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         if !matches!(event.phase, ServerTickPhase::ServerTickEnd { .. }) {
             return;
         }
         let pending = std::mem::take(&mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()));
         for felling in pending {
-            felling.run(&mut |line| host.run_command(line));
+            felling.run(&mut |line| host.commands().run_command(line));
         }
     }
 }
@@ -316,6 +301,7 @@ impl Hooks for Mod {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn world(blocks: &[([i32; 3], &str, Option<u32>)]) -> HashMap<[i32; 3], Block> {
         blocks
